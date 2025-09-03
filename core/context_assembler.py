@@ -5,12 +5,17 @@ import os
 # Add project root to Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
+
 from typing import List, Dict, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
+import logging
+
 from models.memory_item import MemoryItem
 from utils.similarity import cosine_similarity
 from utils.token_counter import estimate_tokens
+
+logger = logging.getLogger(__name__)
 
 class ContextAssembler:
     """Assembles relevant memory context for conversations"""
@@ -27,6 +32,28 @@ class ContextAssembler:
             'insight': 0.1
         }
     
+    def _ensure_datetime(self, dt_value) -> datetime:
+        """Ensure a value is a datetime object - FIXED for string handling"""
+        if isinstance(dt_value, str):
+            try:
+                if dt_value.endswith('Z'):
+                    return datetime.fromisoformat(dt_value.replace('Z', '+00:00'))
+                elif '+' in dt_value or dt_value.endswith('00:00'):
+                    return datetime.fromisoformat(dt_value)
+                else:
+                    # Assume UTC if no timezone info
+                    return datetime.fromisoformat(dt_value).replace(tzinfo=timezone.utc)
+            except ValueError:
+                # Fallback to current time if parsing fails
+                return datetime.now(timezone.utc)
+        elif isinstance(dt_value, datetime):
+            if dt_value.tzinfo is None:
+                return dt_value.replace(tzinfo=timezone.utc)
+            return dt_value
+        else:
+            # Fallback for any other type
+            return datetime.now(timezone.utc)
+    
     async def assemble_context(self, 
                               memories: List[MemoryItem],
                               query_vector: List[float],
@@ -41,20 +68,25 @@ class ContextAssembler:
         if not memories:
             return [], {"reason": "no_memories_available", "token_count": 0}
         
-        # Step 1: Score all memories for relevance
-        scored_memories = await self._score_memories(memories, query_vector, current_query, user_context)
-        
-        # Step 2: Apply diversity filtering
-        diverse_memories = self._ensure_diversity(scored_memories)
-        
-        # Step 3: Fit within token budget
-        selected_memories, metadata = self._fit_token_budget(diverse_memories, current_query)
-        
-        # Step 4: Update access tracking
-        for memory in selected_memories:
-            memory.update_access()
-        
-        return selected_memories, metadata
+        try:
+            # Step 1: Score all memories for relevance
+            scored_memories = await self._score_memories(memories, query_vector, current_query, user_context)
+            
+            # Step 2: Apply diversity filtering
+            diverse_memories = self._ensure_diversity(scored_memories)
+            
+            # Step 3: Fit within token budget
+            selected_memories, metadata = self._fit_token_budget(diverse_memories, current_query)
+            
+            # Step 4: Update access tracking
+            for memory in selected_memories:
+                memory.update_access()
+            
+            return selected_memories, metadata
+            
+        except Exception as e:
+            logger.error(f"Error in assemble_context: {e}")
+            return [], {"reason": "error", "error": str(e)}
     
     async def _score_memories(self, 
                              memories: List[MemoryItem],
@@ -65,82 +97,106 @@ class ContextAssembler:
         scored_memories = []
         
         for memory in memories:
-            # Base similarity score
-            similarity = cosine_similarity(memory.feature_vector, query_vector)
-            
-            # Output gate score (relevance for current context)
-            output_score = memory.gate_scores.get('output', 0.5)
-            
-            # Importance score
-            importance = memory.importance_score
-            
-            # Recency boost
-            recency_score = self._calculate_recency_score(memory)
-            
-            # Access frequency (popular memories get slight boost)
-            frequency_boost = min(0.2, memory.access_frequency * 0.01)
-            
-            # Temporal relevance (if user context provides time info)
-            temporal_score = 1.0
-            if user_context and 'current_time_context' in user_context:
-                temporal_score = self._calculate_temporal_relevance(memory, user_context)
-            
-            # Final weighted score
-            final_score = (
-                similarity * 0.35 +
-                output_score * 0.25 +
-                importance * 0.20 +
-                recency_score * 0.10 +
-                frequency_boost +
-                temporal_score * 0.10
-            )
-            
-            scored_memories.append((memory, final_score))
+            try:
+                # Base similarity score
+                similarity = cosine_similarity(memory.feature_vector, query_vector)
+                
+                # Output gate score (relevance for current context)
+                output_score = memory.gate_scores.get('output', 0.5)
+                
+                # Importance score
+                importance = memory.importance_score
+                
+                # Recency boost - FIXED to handle string datetimes
+                recency_score = self._calculate_recency_score(memory)
+                
+                # Access frequency (popular memories get slight boost)
+                frequency_boost = min(0.2, memory.access_frequency * 0.01)
+                
+                # Temporal relevance (if user context provides time info)
+                temporal_score = 1.0
+                if user_context and 'current_time_context' in user_context:
+                    temporal_score = self._calculate_temporal_relevance(memory, user_context)
+                
+                # Final weighted score
+                final_score = (
+                    similarity * 0.35 +
+                    output_score * 0.25 +
+                    importance * 0.20 +
+                    recency_score * 0.10 +
+                    frequency_boost +
+                    temporal_score * 0.10
+                )
+                
+                scored_memories.append((memory, final_score))
+                
+            except Exception as e:
+                logger.warning(f"Error scoring memory {memory.id}: {e}")
+                continue
         
         # Sort by score descending
         scored_memories.sort(key=lambda x: x[1], reverse=True)
         return scored_memories
     
     def _calculate_recency_score(self, memory: MemoryItem) -> float:
-        """Calculate recency score (more recent = higher score)"""
-        days_old = (datetime.now() - memory.created_at).days
-        days_since_access = (datetime.now() - memory.last_accessed).days
+        """Calculate recency score (more recent = higher score) - FIXED for datetime handling"""
+        now = datetime.now(timezone.utc)
         
-        # Recent creation boost
-        creation_recency = max(0.0, 1.0 - (days_old * 0.03))  # Decay over ~30 days
+        # Ensure datetime objects - FIXED
+        created_at = self._ensure_datetime(memory.created_at)
+        last_accessed = self._ensure_datetime(memory.last_accessed)
         
-        # Recent access boost
-        access_recency = max(0.0, 1.0 - (days_since_access * 0.05))  # Decay over ~20 days
-        
-        return (creation_recency + access_recency) / 2
+        try:
+            days_old = (now - created_at).days
+            days_since_access = (now - last_accessed).days
+            
+            # Recent creation boost
+            creation_recency = max(0.0, 1.0 - (days_old * 0.03))  # Decay over ~30 days
+            
+            # Recent access boost
+            access_recency = max(0.0, 1.0 - (days_since_access * 0.05))  # Decay over ~20 days
+            
+            return (creation_recency + access_recency) / 2
+            
+        except Exception as e:
+            logger.warning(f"Error calculating recency for memory {memory.id}: {e}")
+            return 0.5  # Default middle score
     
     def _calculate_temporal_relevance(self, memory: MemoryItem, user_context: Dict) -> float:
         """Calculate how temporally relevant this memory is"""
         current_time = user_context.get('current_time_context', {})
         
-        # Check for time-of-day relevance
-        if 'hour' in current_time and memory.created_at:
-            memory_hour = memory.created_at.hour
-            current_hour = current_time['hour']
-            hour_diff = min(abs(memory_hour - current_hour), 24 - abs(memory_hour - current_hour))
-            time_relevance = max(0.0, 1.0 - (hour_diff / 12))  # Similar times get boost
-        else:
-            time_relevance = 0.5
+        # Ensure datetime object
+        created_at = self._ensure_datetime(memory.created_at)
         
-        # Check for day-of-week relevance
-        if 'weekday' in current_time and memory.created_at:
-            memory_weekday = memory.created_at.weekday()
-            current_weekday = current_time['weekday']
-            if memory_weekday == current_weekday:
-                weekday_relevance = 1.0
-            elif abs(memory_weekday - current_weekday) <= 1:
-                weekday_relevance = 0.7
+        try:
+            # Check for time-of-day relevance
+            if 'hour' in current_time:
+                memory_hour = created_at.hour
+                current_hour = current_time['hour']
+                hour_diff = min(abs(memory_hour - current_hour), 24 - abs(memory_hour - current_hour))
+                time_relevance = max(0.0, 1.0 - (hour_diff / 12))  # Similar times get boost
             else:
-                weekday_relevance = 0.3
-        else:
-            weekday_relevance = 0.5
-        
-        return (time_relevance + weekday_relevance) / 2
+                time_relevance = 0.5
+            
+            # Check for day-of-week relevance
+            if 'weekday' in current_time:
+                memory_weekday = created_at.weekday()
+                current_weekday = current_time['weekday']
+                if memory_weekday == current_weekday:
+                    weekday_relevance = 1.0
+                elif abs(memory_weekday - current_weekday) <= 1:
+                    weekday_relevance = 0.7
+                else:
+                    weekday_relevance = 0.3
+            else:
+                weekday_relevance = 0.5
+            
+            return (time_relevance + weekday_relevance) / 2
+            
+        except Exception as e:
+            logger.warning(f"Error calculating temporal relevance for memory {memory.id}: {e}")
+            return 0.5  # Default middle score
     
     def _ensure_diversity(self, scored_memories: List[Tuple[MemoryItem, float]]) -> List[Tuple[MemoryItem, float]]:
         """Ensure diversity in memory types while maintaining relevance"""
@@ -155,42 +211,41 @@ class ContextAssembler:
                 type_groups[mem_type] = []
             type_groups[mem_type].append((memory, score))
         
-        # Calculate target count per type based on weights
+        # Calculate target count for each type
         diverse_memories = []
         remaining_slots = self.max_memories
         
-        for mem_type, target_weight in self.diversity_weights.items():
+        for mem_type, weight in self.diversity_weights.items():
             if mem_type in type_groups and remaining_slots > 0:
-                target_count = max(1, int(self.max_memories * target_weight))
+                target_count = max(1, int(self.max_memories * weight))
                 actual_count = min(target_count, len(type_groups[mem_type]), remaining_slots)
                 
-                # Take the top scored memories of this type
-                type_memories = type_groups[mem_type][:actual_count]
-                diverse_memories.extend(type_memories)
+                # Take top memories of this type
+                type_memories = sorted(type_groups[mem_type], key=lambda x: x[1], reverse=True)
+                diverse_memories.extend(type_memories[:actual_count])
                 remaining_slots -= actual_count
         
-        # Fill remaining slots with highest scoring memories not yet selected
-        selected_ids = {mem.id for mem, _ in diverse_memories}
-        for memory, score in scored_memories:
-            if remaining_slots <= 0:
-                break
-            if memory.id not in selected_ids:
-                diverse_memories.append((memory, score))
-                remaining_slots -= 1
+        # Fill remaining slots with highest scoring memories
+        if remaining_slots > 0:
+            used_memory_ids = {mem.id for mem, _ in diverse_memories}
+            remaining_memories = [(mem, score) for mem, score in scored_memories 
+                                 if mem.id not in used_memory_ids]
+            
+            remaining_memories.sort(key=lambda x: x[1], reverse=True)
+            diverse_memories.extend(remaining_memories[:remaining_slots])
         
-        # Sort by score again
+        # Sort final list by score
         diverse_memories.sort(key=lambda x: x[1], reverse=True)
         return diverse_memories
     
-    def _fit_token_budget(self, scored_memories: List[Tuple[MemoryItem, float]], 
-                         current_query: str) -> Tuple[List[MemoryItem], Dict]:
-        """Fit memories within token budget"""
+    def _fit_token_budget(self, scored_memories: List[Tuple[MemoryItem, float]], query: str) -> Tuple[List[MemoryItem], Dict]:
+        """Select memories that fit within token budget"""
         selected_memories = []
         total_tokens = 0
         
-        # Reserve tokens for query and system overhead
-        query_tokens = estimate_tokens(current_query)
-        overhead_tokens = 100  # System prompts, formatting, etc.
+        # Reserve tokens for query and formatting overhead
+        query_tokens = estimate_tokens(query)
+        overhead_tokens = 200  # For formatting, instructions, etc.
         available_tokens = self.max_tokens - query_tokens - overhead_tokens
         
         metadata = {
@@ -263,7 +318,9 @@ class ContextAssembler:
                 context_parts.append(f"\n--- {mem_type.upper()} MEMORIES ---")
                 
                 for memory in type_memories:
-                    time_str = memory.created_at.strftime("%Y-%m-%d %H:%M")
+                    # Ensure datetime for formatting
+                    created_at = self._ensure_datetime(memory.created_at)
+                    time_str = created_at.strftime("%Y-%m-%d %H:%M")
                     importance_str = f"{memory.importance_score:.2f}"
                     
                     context_parts.append(
@@ -284,6 +341,8 @@ class ContextAssembler:
         importance_scores = []
         ages_days = []
         
+        now = datetime.now(timezone.utc)
+        
         for memory in memories:
             # Type distribution
             mem_type = memory.memory_type
@@ -292,17 +351,21 @@ class ContextAssembler:
             # Importance distribution
             importance_scores.append(memory.importance_score)
             
-            # Age distribution
-            age_days = (datetime.now() - memory.created_at).days
-            ages_days.append(age_days)
+            # Age distribution - ensure datetime
+            try:
+                created_at = self._ensure_datetime(memory.created_at)
+                age_days = (now - created_at).days
+                ages_days.append(age_days)
+            except Exception:
+                ages_days.append(0)  # Default for error cases
         
         return {
             "total_memories": len(memories),
             "type_distribution": type_counts,
-            "avg_importance": np.mean(importance_scores),
-            "importance_range": (min(importance_scores), max(importance_scores)),
-            "avg_age_days": np.mean(ages_days),
-            "age_range_days": (min(ages_days), max(ages_days)),
-            "newest_memory_age": min(ages_days),
-            "oldest_memory_age": max(ages_days)
+            "avg_importance": np.mean(importance_scores) if importance_scores else 0.0,
+            "importance_range": (min(importance_scores), max(importance_scores)) if importance_scores else (0, 0),
+            "avg_age_days": np.mean(ages_days) if ages_days else 0.0,
+            "age_range_days": (min(ages_days), max(ages_days)) if ages_days else (0, 0),
+            "newest_memory_age": min(ages_days) if ages_days else 0,
+            "oldest_memory_age": max(ages_days) if ages_days else 0
         }
